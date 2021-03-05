@@ -124,10 +124,7 @@ def cap(x, extreme=5):
     # 生成分位数
     width = (x.quantile(0.75) - x.quantile(0.25)) / 2
     median = x.median()
-    x.loc[x < (median - extreme * width)] = median - extreme * width
-    x.loc[x > (median + extreme * width)] = median + extreme * width
-
-    return (x)
+    return x.clip(median - extreme * width, median + extreme * width)
 
 
 # ---------------------------------

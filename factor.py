@@ -3,11 +3,13 @@ import pandas as pd
 import numpy as np
 import os
 from scipy.stats import spearmanr, pearsonr
-from .utils import *
+from utils import *
 import statsmodels.api as sm
 from scipy.linalg import norm
 from scipy import stats
 from numpy.random import multinomial, normal
+from scipy.optimize import minimize
+from sklearn.covariance import LedoitWolf
 
 set_matplotlib()
 
@@ -123,8 +125,29 @@ class FactorUtils(object):
         return converted
 
     @staticmethod
-    def winsorize():
-        pass
+    def preprocess(factor_long, standardize=True, cap_=True, extreme=5):
+        """
+        单个因子在截面上的异常值处理和标准化
+        :param factor_long: DataFrame, 长型因子数据(单因子单截面)，通常为groupby的元素
+        :param standardize: bool, 是否要标准化
+        :param cap: bool, 是否要处理异常值
+        :param extreme: int, 异常值定义中离中位数的四分位距倍数
+        """
+        tmp = factor_long.copy()
+        if cap_:
+            tmp['factor_val'] = cap(tmp['factor_val'], extreme)
+        if standardize:
+            tmp['factor_val'] = (tmp['factor_val'] - tmp['factor_val'].mean()) / tmp['factor_val'].std()
+        return tmp
+
+    @staticmethod
+    def my_pearsonr(x, y):
+        """
+        nan tolerant pearsonr
+        """
+        nas = x.isna() | y.isna()
+        corr = pearsonr(x[~nas], y[~nas])
+        return corr
 
 
 class FactorData(object):
@@ -132,6 +155,7 @@ class FactorData(object):
     (多)因子数据结构
     以长型矩阵(dataframe)存储
     可生成面板、截面、时间序列回归所需的数据集generator
+    TODO: 展示极端值和缺失值情况
     """
     def __init__(self, factor_long):
         """
@@ -143,6 +167,15 @@ class FactorData(object):
         calendar.sort()
         self.calendar = pd.Series(calendar)
 
+    def preprocess(self, standardize=True, cap=True, extreme=5):
+        """
+        读取后预处理
+        :param standardize: bool, 是否要标准化
+        :param cap: bool, 是否要处理异常值
+        :param extreme: int, 异常值定义中离中位数的四分位距倍数
+        """
+        self.factor_long = self.factor_long.groupby(['tradeDate', 'factor_name']).apply(lambda x: FactorUtils.preprocess(x, standardize, cap, extreme))
+        
     def make_panel_data(self, X_names, y_name, start=None, end=None):
         """
         转换为面板格式
@@ -236,6 +269,25 @@ class FactorData(object):
                 date_range = sub['tradeDate'].tolist()
                 yield (code, date_range, X, y)
 
+    def gen_tsreg_rolling_unsupervised(self, period='m', look_back=30):
+        """
+        为每个代码生成时间序列数据，常用于回归计算beta,alpha
+        :param period: str, d/w/m/h/y, 计算频率
+        :param look_back: int, 每次回归所用的样本量
+        """
+        factor_return = self.factor_long
+        X_names = factor_return['factor_name'].unique().tolist()
+        all_data_wide = factor_return.pivot(index='tradeDate', columns='factor_name', values='factor_val').reset_index()
+        time_ticker = all_data_wide['tradeDate'].apply(lambda x: self.__class__.get_time_ticker(x, period))
+        change_points = time_ticker != time_ticker.shift(-1)
+        change_points = change_points[change_points].index
+
+        for x in change_points:
+            sub = all_data_wide[max(x-look_back,0):x+1]
+            X = sub[X_names]
+            date_range = sub['tradeDate'].tolist()
+            yield (date_range, X)
+
     def gen_cross_sec_panel(self, X_names, y_name, start=None, end=None):
         """
         用于生成截面单因子回归测试所用panel
@@ -263,7 +315,7 @@ class FactorTest(object):
     前者可以看出非线性关系，而IC检测不行；
     当分层回测显示出非线性关系时，应该调整因子encoding方式，或者放弃IC直接做piecewise回归检验
     """
-    def __init__(self, api, factor_dict, return_dict, freq='m', start=None, end=None):
+    def __init__(self, api, factor_dict, return_dict, freq='m', start=None, end=None, standardize=True, cap=True, extreme=5):
         """
         初始化
         :param api: 数据库接口
@@ -271,17 +323,44 @@ class FactorTest(object):
         :param return_dict: dict, {表名: [价格名,]}
         :param freq: str, 测试频率
         :param start/end: date, 读取数据的起始/结束时间 
+        :param standardize: bool, 是否要标准化
+        :param cap: bool, 是否要处理异常值
+        :param extreme: int, 异常值定义中离中位数的四分位距倍数
         """
         self.api = api
-        self.return_data = api.get_price_quote(return_dict, freq, start=start, end=end).pivot(index='windCode', columns='tradeDate', values='factor_val')
-        factor_data = api.get_factors(factor_dict)
-        self.factor_df = factor_data.pivot(index='windCode', columns='tradeDate', values='factor_val')
+        self.standardize = standardize
+        self.cap = cap
+        self.extreme = extreme
+        self.update_return_data(return_dict, freq, start, end)
+        self.update_factor_data(factor_dict)
+
+        # 默认测试区间
+        self.start = self.calendar[0]
+        self.end = self.calendar[-1]
+
+    def update_factor_data(self, factor_dict):
+        """
+        读取/重新读取因子数据
+        :param factor_dict: dict, {表名: [因子名,]}
+        """
+        api = self.api
+        self.factor_data = api.get_factors(factor_dict)
+        self.factor_data.groupby(['tradeDate', 'factor_name']).apply(lambda x: FactorUtils.preprocess(x, self.standardize, self.cap, self.extreme))
+        self.factor_df = self.factor_data.pivot(index='windCode', columns='tradeDate', values='factor_val')
         self.fac_name = list(factor_dict.values())[0][0]
-        
+
         # 对齐因子和价格数据
         union_index = self.return_data.columns.union(self.factor_df.columns).sort_values()
         self.factor_df = self.factor_df.T.reindex(union_index, method='ffill').reindex(self.return_data.columns).T
         self.calendar = self.return_data.columns
+
+    def update_return_data(self, return_dict, freq, start, end):
+        """
+        读取/重新读取收益率数据
+        :param return_dict: dict, {表名: [价格名,]}
+        """
+        api = self.api
+        self.return_data = api.get_price_quote(return_dict, freq, start=start, end=end).pivot(index='windCode', columns='tradeDate', values='factor_val')
         
     def _portfolio_return_single_period(self, codes, period, weight=None):
         """
@@ -302,19 +381,25 @@ class FactorTest(object):
         groups = np.array_split(selected.index, group_num)
         return groups
         
-    def calc_group_cum_return(self, start, end, group_num=5, compound=True, ar=True):
+    def calc_group_cum_return(self, start=None, end=None, group_num=5, compound=True, ar=True):
         """
         对区间中的每个截面分层，计算每层累计收益
         :param start/end: date, 回测起点/终点
         :param group_num: int, 分层数
         :param compound: bool, 是否以复利计算，单利计算可以避免初始阶段区别造成的巨大影响
         :param ar: bool，是否以当期所有资产等权组合的收益作为基准计算超额收益
+        TODO: 多空组合的收益曲线、sharpe比例；但在基金中用不到，因为难以做空
         """
+        if start is None:
+            start = self.start
+        if end is None:
+            end = self.end
+
         port_returns = []
         base_returns = []
         c = self.calendar
-        periods = c[c.get_loc(start):c.get_loc(end)+1]
-        ed = c[c.get_loc(end)+1]
+        periods = c[c.get_loc(start):c.get_loc(end)]
+        ed = c[c.get_loc(end)]
         
         for period in periods:
             tmp = []
@@ -343,10 +428,15 @@ class FactorTest(object):
             crt = crt.apply(lambda x: x - brt)
         return crt
     
-    def plot_group_cum_return(self, start, end, group_num=3, compound=True, ar=True):
+    def plot_group_cum_return(self, start=None, end=None, group_num=5, compound=True, ar=True):
         """
         绘制分层回测图
         """
+        if start is None:
+            start = self.start
+        if end is None:
+            end = self.end
+
         fig, ax = whiteboard()
         crt = self.calc_group_cum_return(start, end, group_num, compound, ar)
         crt.plot(ax=ax, linewidth=1.1)
@@ -362,18 +452,23 @@ class FactorTest(object):
         if rank:
             corr = spearmanr
         else:
-            corr = pearsonr
+            corr = FactorUtils.my_pearsonr
         fval = self.factor_df[period].dropna()
         rt = self.return_data[period].reindex(fval.index)
         return corr(fval, rt)[0]
 
-    def calc_IC_series(self, start, end, rank=True, summary=False):
+    def calc_IC_series(self, start=None, end=None, rank=True, summary=False):
         """
         计算IC序列
         :param start/end: date, 计算IC序列的时间区间
         :param rank: bool, 是否计算rank IC
         :param summary: bool, 是否返回IC序列的统计量
         """
+        if start is None:
+            start = self.start
+        if end is None:
+            end = self.end
+
         IC_series = []
         c = self.calendar
         periods = c[c.get_loc(start):c.get_loc(end)+1]
@@ -390,10 +485,15 @@ class FactorTest(object):
         else:
             return IC_series
 
-    def IC_series_plot(self, start, end, rank=True):
+    def plot_IC_series(self, start=None, end=None, rank=True):
         """
         绘制IC序列图
         """
+        if start is None:
+            start = self.start
+        if end is None:
+            end = self.end
+
         if rank:
             prefix = 'Rank '
         else:
@@ -483,3 +583,132 @@ class FactorReg(object):
         ax.axhline(y=-2,linestyle ='--', color='red', linewidth=1)
         ax.set_ylabel('t-value')
         ax.set_title('%s因子截面回归t值图'%factor_name)
+
+class FactorBlend(object):
+    """
+    因子合成框架
+    1. 线性合成 - max_IR方法
+    2. 机器学习合成 - 结合Optuna自动选择参数 (TODO)
+    """
+    def __init__(self, api, factor_dict_all, return_dict, start=None, end=None):
+        """
+        :param api: 数据库接口
+        :param factor_dict_all: dict, 用于合成的底层因子字典
+        :param return_dict: dict, 收益率字典
+        :param start/end: date, 读取数据的时间区间
+        """
+        self.api = api
+        self.names = FactorUtils.concat_lol(list(factor_dict_all.values()))
+        self.factor_dict_all = factor_dict_all
+        self.return_dict = return_dict
+        self.start = start
+        self.end = end
+        
+    def load_data(self, rank=False):
+        """
+        读取数据，合并，计算ic
+        :param rank: bool, 是否用rank IC，理论上错误但实际上可能有用
+        """
+        factor_dict_all, return_dict = self.factor_dict_all, self.return_dict
+        api, start, end = self.api, self.start, self.end
+        names = self.names
+        factor_data_all = []
+        ic_ser_all = []
+        factor_num = 0
+
+        for table_name, factor_list in factor_dict_all.items():
+            for factor_name in factor_list:
+                factor_dict = {table_name: [factor_name,]}
+                if factor_num == 0:
+                    factor_test = FactorTest(api, factor_dict, return_dict)
+                else:
+                    factor_test.update_factor_data(factor_dict)
+                ic_ser = factor_test.calc_IC_series(start, end, rank=rank)
+                ic_ser_all.append(ic_ser)
+                factor_data_all.append(factor_test.factor_data)
+                factor_num += 1
+
+        ic_ser_all = pd.concat(ic_ser_all, axis=1)
+        ic_ser_all.columns = names
+        ic_ser_all = ic_ser_all.reset_index().melt(id_vars='tradeDate', var_name='factor_name', value_name='factor_val')
+        ic_ser_all['windCode'] = 'M'
+        
+        self.factor_data_all = pd.concat(factor_data_all)
+        self.ic_ser_all = FactorData(ic_ser_all)
+        self.factor_num = factor_num
+        
+        self.AVG_WEIGHT = 1.0 / factor_num
+        self.return_data = factor_test.return_data
+        
+    def blend_ic_ir(self, blended_name, period='m', look_back=30, ewa=False, rank=False, positive=False):
+        """
+        :param blended_name: str, 合成因子的名称
+        :param period: str, 合成周期
+        :param look_back: int, 用于估计IR的时序样本量
+        :param ewa: bool, 估计IC均值时是否用exponential weight
+        :param rank: bool, 是否使用rank IC
+        :param positive: bool, 是否使用权重非负约束
+        """
+        print('loading data...')
+        self.load_data(rank)
+        print('done;')
+        
+        ic_ser_all = self.ic_ser_all
+        names = self.names
+        AVG_WEIGHT = self.AVG_WEIGHT
+        factor_num = self.factor_num
+        factor_data_all = self.factor_data_all
+        
+        ic_ts_generator = ic_ser_all.gen_tsreg_rolling_unsupervised(period, look_back)
+        weight_collection = []
+        date_collection = []
+        
+        print('calculating blend weights...')
+        for dr, X in ic_ts_generator:
+            X = X.fillna(0.0)
+            cov = LedoitWolf().fit(X).covariance_
+            if ewa:
+                ic_mean = X.ewm(halflife=0.25*len(X)).mean().values[-1]
+            else:
+                ic_mean = X.mean().values
+            fun = lambda w: - w.T.dot(ic_mean) / np.sqrt(w.T.dot(cov).dot(w))
+            init = np.array([AVG_WEIGHT, ] * factor_num)
+            cons = ({'type': 'ineq', 'fun': lambda x: x})
+            if positive:
+                res = minimize(fun, init, method='SLSQP', constraints=cons).x
+            else:
+                res = minimize(fun, init, method='SLSQP').x
+            res = res / np.sqrt(np.sum(res ** 2))
+            weight_collection.append(res.tolist())
+            date_collection.append(dr[-1])
+        print('done;')
+        
+        weight_collection = pd.DataFrame(weight_collection, index=date_collection, columns=names)
+        weight_collection = weight_collection.fillna(AVG_WEIGHT)
+        self.weight_collection = weight_collection.copy()
+        weight_collection = weight_collection.reset_index().melt(id_vars='index', var_name='factor_name', value_name='weight').rename(columns={'index': 'tradeDate'})
+        merged = pd.merge(left=factor_data_all, right=weight_collection, left_on=['tradeDate', 'factor_name'], right_on=['tradeDate', 'factor_name'], how='left')
+        merged['factor_val'] = merged['factor_val'] * merged['weight']
+
+        blended_factor_long = merged.dropna().groupby(['tradeDate', 'windCode'])['factor_val'].sum().reset_index()
+        blended_factor_long['factor_name'] = blended_name
+        self.blended_factor_long = blended_factor_long
+        print('blended factor %s ready;' % blended_name)
+
+    def plot_weight(self):
+        """
+        绘制合成权重的序列图
+        """
+        fig, ax = whiteboard()
+        self.weight_collection.plot(ax=ax, linewidth=1.1)
+        ax.set_xlabel('日期')
+        ax.set_ylabel('因子权重')
+        ax.set_title('合成权重序列')
+
+    def save(self, table_name):
+        """
+        保存因子
+        :param table_name: str, 保存的表名
+        """
+        api = self.api
+        api.save_factor_data(self.blended_factor_long, table_name)
