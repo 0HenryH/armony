@@ -17,6 +17,7 @@ from sklearn.model_selection import KFold
 from sklearn.model_selection._split import _BaseKFold, indexable, _num_samples
 from sklearn.utils.validation import _deprecate_positional_args
 from openpyxl import load_workbook, Workbook
+import xlrd
 
 
 # ---------------------------------
@@ -285,8 +286,84 @@ def js_encoding(X_fit, y_fit, cols, X_test=None, model='independent'):
 
 
 # ---------------------------------
+# Time Series Analysis
+# ---------------------------------
+
+# kalman filter rolling least square
+def RLS(x, y, beta_init=None, R_init=None, delta=0.02, Ve=0.001, intercept=True):
+    n, p = x.shape
+    
+    if intercept:
+        intercept_ = np.ones([n, 1])
+        x = np.hstack([intercept_, x])
+        p += 1
+    
+    yhat = np.zeros(n)
+    e = np.zeros(n)
+    Q = np.zeros(n)
+    
+    if R_init is None:
+        R = np.zeros([p, p])
+    else:
+        R = R_init
+    beta = np.zeros([p, n])
+    
+    Vw = delta / (1 - delta) * np.eye(p)
+    # Ve = 
+    
+    # initialize
+    if beta_init is not None:
+        beta[:, 0] = beta_init
+    
+    # kalman loop
+    for t in range(n):
+        if t > 0:
+            beta[:, t] = beta[:, t-1]  # state prediction
+            R = P + Vw  # state covariance prediction
+        xt = x[t, :]
+        yhat[t] = xt.dot(beta[:, t])  # measurement prediction
+        Q[t] = xt.dot(R).dot(xt.T) + Ve  # measurement variance
+        
+        e[t] = y[t] - yhat[t]  # measurement residual
+        K = R.dot(xt) / Q[t]  # kalman gain
+        
+        beta[:, t] = beta[:, t] + K * e[t]  # state update
+        P = (1 - K.dot(xt)) * R
+    
+    return beta
+
+
+# kalman filter rls with ols start
+def ols_start_rls(x, y, start=100, delta=0.1, Ve=0.002, intercept=True):
+    x_start = x[:start, :]
+    y_start = y[:start]
+    
+    if intercept:
+        intercept_ = np.ones([start, 1])
+        x_start = np.hstack([intercept_, x_start])
+    _, p = x_start.shape
+    beta_init = pinv(x_start.T.dot(x_start)).dot(x_start.T.dot(y_start))
+    e = y_start - x_start.dot(beta_init)
+    sig_hat_square = e.dot(e) / (start - p - 1)
+    R_init = sig_hat_square * pinv(x_start.T.dot(x_start))
+    
+    x_tail = x[start:, :]
+    y_tail = y[start:]
+    
+    beta_tail = RLS(x_tail, y_tail, beta_init=beta_init, R_init=R_init, delta=delta, Ve=Ve, intercept=intercept)
+    return (beta_init, beta_tail)
+
+
+# ---------------------------------
 # 其他
 # ---------------------------------
+
+# 查表名
+def get_sheetname(fp):
+    xls = xlrd.open_workbook(fp, on_demand=True)
+    return xls.sheet_names()
+
+
 def _mdf_func(func, name, group):
     return func(group), name
 

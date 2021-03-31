@@ -11,6 +11,7 @@ from numpy.random import multinomial, normal
 from scipy.optimize import minimize
 from sklearn.covariance import LedoitWolf
 
+ANN_COEF = {'d': 252, 'w': 52, 'm': 12, 'h': 2, 'y': 1}
 set_matplotlib()
 
 class FactorUtils(object):
@@ -149,6 +150,29 @@ class FactorUtils(object):
         corr = pearsonr(x[~nas], y[~nas])
         return corr
 
+    @staticmethod
+    def sharpe(returns, freq, rf=0.03):
+        adj_factor = ANN_COEF[freq]
+        adj_rf = rf / adj_factor
+        adj_returns = returns - adj_rf
+        
+        res = np.nanmean(adj_returns) * np.sqrt(adj_factor) / np.nanstd(adj_returns, ddof=1)
+        return res
+
+    @staticmethod
+    def max_drawdown(returns):
+        cum_nv = (returns+1).cumprod()
+        peak = cum_nv.expanding(min_periods=1).max()
+        dd = (cum_nv/peak)-1
+        return dd.min()
+
+    @staticmethod
+    def calmar(returns, freq):
+        adj_factor = ANN_COEF[freq]
+        er = np.nanmean(returns) * adj_factor
+        md = FactorUtils.max_drawdown(returns)
+        return er / np.abs(md)
+
 
 class FactorData(object):
     """
@@ -200,10 +224,10 @@ class FactorData(object):
         """
         factor_long = self.factor_long
 
-        factor_return = factor_long.query("`code`=='M'")
+        factor_return = factor_long.query("`windCode`=='M'")
         X_names = factor_return['factor_name'].unique().tolist()
         y_name = 'factor_val'
-        asset_return = factor_long.query("`code`!='M'")
+        asset_return = factor_long.query("`windCode`!='M'")
         factor_return = factor_return.pivot(index='tradeDate', columns='factor_name', values='factor_val').reset_index()
         all_data_wide = pd.merge(left=asset_return, right=factor_return, left_on='tradeDate', right_on='tradeDate', how='left').sort_values('tradeDate')
 
@@ -247,10 +271,10 @@ class FactorData(object):
         """
         factor_long = self.factor_long
 
-        factor_return = factor_long.query("`code`=='M'")
+        factor_return = factor_long.query("`windCode`=='M'")
         X_names = factor_return['factor_name'].unique().tolist()
         y_name = 'factor_val'
-        asset_return = factor_long.query("`code`!='M'")
+        asset_return = factor_long.query("`windCode`!='M'")
         factor_return = factor_return.pivot(index='tradeDate', columns='factor_name', values='factor_val').reset_index()
         all_data_wide = pd.merge(left=asset_return, right=factor_return, left_on='tradeDate', right_on='tradeDate', how='left').sort_values('tradeDate')
 
@@ -333,6 +357,7 @@ class FactorTest(object):
         self.extreme = extreme
         self.update_return_data(return_dict, freq, start, end)
         self.update_factor_data(factor_dict)
+        self.freq = freq
 
         # 默认测试区间
         self.start = self.calendar[0]
@@ -367,6 +392,8 @@ class FactorTest(object):
         计算单个截面期的组合收益率，默认等权组合
         """
         selected = self.return_data.loc[codes][period]
+        if len(selected) == 0:
+            return 0.0
         if weight is None:
             pr = np.mean(selected)
         else:
@@ -380,14 +407,26 @@ class FactorTest(object):
         selected = self.factor_df[period].dropna().sort_values()
         groups = np.array_split(selected.index, group_num)
         return groups
+
+    def _get_group_codes_level(self, period, unique_vals):
+        """
+        对于离散型因子，按所有level分层
+        """
+        selected = self.factor_df[period].dropna()
+        groups = []
+        for val in unique_vals:
+            groups.append(selected[selected==val].index)
+        return groups
         
-    def calc_group_cum_return(self, start=None, end=None, group_num=5, compound=True, ar=True):
+    def calc_group_cum_return(self, start=None, end=None, group_num=5, compound=True, ar=True, summary=False, discrete=False):
         """
         对区间中的每个截面分层，计算每层累计收益
         :param start/end: date, 回测起点/终点
         :param group_num: int, 分层数
         :param compound: bool, 是否以复利计算，单利计算可以避免初始阶段区别造成的巨大影响
         :param ar: bool，是否以当期所有资产等权组合的收益作为基准计算超额收益
+        :param summary: bool，是否返回各层组合的sharpe ratio, max_drawdown, calmar ratio
+        :param discrete: bool, 是否是离散型变量，需要改变分层方法
         TODO: 多空组合的收益曲线、sharpe比例；但在基金中用不到，因为难以做空
         """
         if start is None:
@@ -400,10 +439,18 @@ class FactorTest(object):
         c = self.calendar
         periods = c[c.get_loc(start):c.get_loc(end)]
         ed = c[c.get_loc(end)]
+
+        if discrete:
+            all_vals = self.factor_df.values.flatten()
+            all_vals = all_vals[~np.isnan(all_vals)]
+            unique_vals = np.sort(pd.unique(all_vals))
         
         for period in periods:
             tmp = []
-            period_groups = self._get_group_codes(period, group_num=group_num)
+            if discrete:
+                period_groups = self._get_group_codes_level(period, unique_vals)
+            else:
+                period_groups = self._get_group_codes(period, group_num=group_num)
             period_all_codes = FactorUtils.concat_lol(period_groups)
             br = self._portfolio_return_single_period(period_all_codes, period)
             base_returns.append(br)
@@ -423,12 +470,22 @@ class FactorTest(object):
         else:
             crt = port_returns.shift(1).fillna(0.0).cumsum()
             brt = base_returns.shift(1).fillna(0.0).cumsum()
+        
+        if summary:
+            freq = self.freq
+            pft = crt.iloc[-1, :] / crt.iloc[0, :] - 1.0
+            sr = port_returns.apply(lambda x: FactorUtils.sharpe(x, freq))
+            md = port_returns.apply(lambda x: FactorUtils.max_drawdown(x))
+            cr = port_returns.apply(lambda x: FactorUtils.calmar(x, freq))
+            summary_stat = pd.concat([pft, sr, md, cr], axis=1)
+            summary_stat.columns = ['收益率', 'Sharpe Ratio', 'Max Drawdown', 'Calmar Ratio']
+            return summary_stat
 
         if ar:
             crt = crt.apply(lambda x: x - brt)
         return crt
     
-    def plot_group_cum_return(self, start=None, end=None, group_num=5, compound=True, ar=True):
+    def plot_group_cum_return(self, start=None, end=None, group_num=5, compound=True, ar=True, discrete=False):
         """
         绘制分层回测图
         """
@@ -436,9 +493,9 @@ class FactorTest(object):
             start = self.start
         if end is None:
             end = self.end
-
+        
         fig, ax = whiteboard()
-        crt = self.calc_group_cum_return(start, end, group_num, compound, ar)
+        crt = self.calc_group_cum_return(start, end, group_num, compound, ar, discrete)
         crt.plot(ax=ax, linewidth=1.1)
         ax.set_ylabel('累计值')
         ax.set_title('%s分层回测' % self.fac_name)
@@ -535,7 +592,7 @@ class FactorReg(object):
         self.factor_data = FactorData(factor_long)
         self.calendar = self.factor_data.calendar
     
-    def cross_sec_reg_test(self, X_names, y_name, start=None, end=None, summary=False):
+    def cross_sec_reg_test(self, X_names, y_name='return', start=None, end=None, summary=False):
         """
         对每个截面做回归，并汇总
         :param X_names: list, 因子名称
